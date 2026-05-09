@@ -4,7 +4,7 @@ Projeto de backup automatizado com Restic para Windows
 
 ## Resumo Executivo
 
-- entrada publica e enxuta na raiz: install.bat, backup.bat, check.bat, sincronizar_externo.bat, ativar_agora.bat, configurar.bat
+- entrada publica e enxuta na raiz: install.bat, backup.bat, check.bat, sincronizar_externo.bat, ativar_agora.bat, centro_de_controle.bat e configurar.bat (compatibilidade)
 - exportacao limpa para distribuicao via preparar_distribuicao.bat
 - logica de aplicacao isolada em app/
 - provisionamento e cadastro de tarefas isolados em setup/
@@ -44,6 +44,7 @@ C:\restic
 |-- sincronizar_externo.bat
 |-- install.bat
 |-- ativar_agora.bat
+|-- centro_de_controle.bat
 |-- configurar.bat
 |-- preparar_distribuicao.bat
 |-- .gitignore
@@ -308,14 +309,20 @@ Tambem funciona por parametros para automacao, por exemplo:
 Centro de Controle por menu (duplo clique):
 
 ```text
-configurar.bat
+centro_de_controle.bat
 ```
+
+Compatibilidade:
+
+- configurar.bat continua existindo como alias legado e abre o mesmo Centro de Controle
 
 No Centro de Controle, voce consegue:
 
+- seguir um menu principal organizado por visualizacao, configuracao e operacoes
 - ver um painel resumido e mais legivel da configuracao atual
 - ajustar horario do backup e criar/editar o check semanal do scheduler
 - ajustar retencao e quantidade de snapshots guardados
+- visualizar os snapshots que a politica atual manteria, em ordem: recentes, semanais extras e mensais extras
 - ajustar fontes e exclusoes do backup
 - ajustar Telegram, caminhos principais e espelho externo
 - salvar/aplicar/remover perfis (casa/trabalho/outros)
@@ -354,6 +361,7 @@ Nas telas de edicao do Centro de Controle:
 - Enter mantem o valor atual
 - digite voltar para cancelar a tela atual e retornar ao menu
 - em campos como Telegram/exclusoes, digite - para limpar o valor
+- nas telas principais, o fluxo agora mostra contexto, coleta os valores, resume o que sera aplicado e so depois pede escopo ou confirmacao
 - no agendamento, os dias da semana podem ser digitados em portugues: domingo, segunda, terca, quarta, quinta, sexta ou sabado
 
 ## Passo 8 - Executar validacao manual
@@ -467,6 +475,12 @@ No desempacotamento completo no disco externo, o sistema:
 - detecta novamente os discos USB conectados
 - pede o disco e a pasta base onde o repositório externo foi criado
 - usa latest por padrao, ou outro snapshot se voce informar
+- permite escolher entre modo rapido e modo verificado
+- no modo rapido, restaura sem a verificacao final de conteudo e tende a terminar antes
+- no modo verificado, confere o conteudo restaurado ao final e pode demorar bem mais
+- se a pasta de destino ja tiver arquivos, alerta antes e permite limpar essa pasta ou escolher outro nome
+- se o restore for interrompido, o conteudo parcial fica preservado e o staging recebe um arquivo _restore_status.txt com o estado da tentativa
+- na proxima tentativa, o menu le esse arquivo de status e mostra se a ultima execucao terminou, falhou ou ficou interrompida antes de voce decidir limpar ou reaproveitar a pasta
 - restaura tudo para uma subpasta datada dentro de restore-staging, no proprio disco externo
 
 Em outras palavras: a opcao semanal nao recria tudo do zero. Ela reaproveita o repositorio Restic do disco externo e completa apenas o que falta.
@@ -524,13 +538,61 @@ As tarefas registradas apontam para:
 | RESTIC_EXPORT_PASSWORD_FILE | Nao | Arquivo de senha do repositorio externo; se vazio, usa RESTIC_PASSWORD_FILE |
 | RESTIC_TELEGRAM_TOKEN | Nao | Token do bot |
 | RESTIC_TELEGRAM_CHATID | Nao | Chat de notificacao |
-| RESTIC_KEEP_LAST | Nao | Politica keep-last |
-| RESTIC_KEEP_WEEKLY | Nao | Politica keep-weekly |
-| RESTIC_KEEP_MONTHLY | Nao | Politica keep-monthly |
+| RESTIC_KEEP_LAST | Nao | Guarda os N snapshots mais recentes |
+| RESTIC_KEEP_WEEKLY | Nao | Alem do keep-last, guarda 1 snapshot representativo por semana nas ultimas N semanas |
+| RESTIC_KEEP_MONTHLY | Nao | Alem do keep-last, guarda 1 snapshot representativo por mes nos ultimos N meses |
 | RESTIC_BACKUP_SOURCES | Nao | Fontes, separadas por ; |
 | RESTIC_BACKUP_EXCLUDES | Nao | Exclusoes, separadas por ; |
 
 Observacao: as variaveis RESTIC_* sao controladas no Registro do Windows (Scope User ou Machine), nao em arquivo .env.
+
+### Como funciona a retencao de snapshots
+
+O projeto executa o Restic assim:
+
+```text
+restic forget --prune --keep-last <N> --keep-weekly <N> --keep-monthly <N>
+```
+
+Importante: essas regras nao sao somadas como um numero fixo. O Restic avalia todas elas e mantem um snapshot se ele bater em qualquer regra.
+
+Na pratica:
+
+- keep-last 7 = guarda os 7 snapshots mais recentes
+- keep-weekly 4 = alem disso, guarda 1 snapshot representativo por semana nas ultimas 4 semanas
+- keep-monthly 3 = alem disso, guarda 1 snapshot representativo por mes nos ultimos 3 meses
+
+Por isso, o total final nao e sempre 7, 8, 10 ou 14. Ele depende de sobreposicao entre as regras e do calendario.
+
+Exemplo:
+
+- keep-last 7, keep-weekly 4, keep-monthly 3 nao significa guardar exatamente 14 snapshots
+- em alguns cenarios pode guardar so um pouco mais que 7
+- em outros pode guardar varios snapshots antigos adicionais, porque eles representam semanas ou meses que nao estao mais cobertos pelos 7 ultimos
+
+Se o objetivo for simplesmente sempre manter so os ultimos N snapshots, configure assim:
+
+```text
+RESTIC_KEEP_LAST = N
+RESTIC_KEEP_WEEKLY = 0
+RESTIC_KEEP_MONTHLY = 0
+```
+
+Ou seja: weekly e monthly servem para preservar pontos de restauracao mais antigos e mais espalhados no tempo, nao para contar os snapshots mais recentes.
+
+Para inspecionar isso de forma organizada sem alterar nada no repositorio:
+
+```powershell
+.\tools\show_retention_layout.ps1
+```
+
+Esse comando roda um dry-run da politica atual e organiza a leitura em tres camadas:
+
+- recentes = snapshots dentro da janela keep-last
+- semanais extras = snapshots antigos que continuam protegidos pela regra semanal
+- mensais extras = snapshots antigos que continuam protegidos pela regra mensal
+
+O mesmo fluxo tambem ficou disponivel no Centro de Controle, no grupo de visualizacao e diagnostico.
 
 ## Operacao Diaria
 
@@ -610,6 +672,7 @@ backup.bat
 check.bat
 sincronizar_externo.bat
 ativar_agora.bat
+centro_de_controle.bat
 app/
 setup/
 tools/

@@ -328,6 +328,7 @@ function Copy-DistributionFiles {
         'check.bat'
         'sincronizar_externo.bat'
         'ativar_agora.bat'
+        'centro_de_controle.bat'
         'configurar.bat'
         '.gitignore'
     )

@@ -266,6 +266,81 @@ function Get-SnapshotNotesText {
     return (@($Entry.Notes | Select-Object -Unique) -join ', ')
 }
 
+function Test-SnapshotHasNote {
+    param(
+        $Entry,
+        [Parameter(Mandatory)][string]$Pattern
+    )
+
+    if ($null -eq $Entry -or $null -eq $Entry.Notes) {
+        return $false
+    }
+
+    foreach ($Note in @($Entry.Notes)) {
+        if (-not [string]::IsNullOrWhiteSpace($Note) -and $Note.ToLowerInvariant() -match $Pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-RetentionLayout {
+    param($Entries)
+
+    $Recent = [System.Collections.Generic.List[object]]::new()
+    $Extra = [System.Collections.Generic.List[object]]::new()
+    $WeeklyMarkedCount = 0
+    $MonthlyMarkedCount = 0
+
+    foreach ($Entry in @($Entries)) {
+        $IsRecent = Test-SnapshotHasNote -Entry $Entry -Pattern 'last snapshot'
+        $IsWeekly = Test-SnapshotHasNote -Entry $Entry -Pattern 'weekly snapshot'
+        $IsMonthly = Test-SnapshotHasNote -Entry $Entry -Pattern 'monthly snapshot'
+
+        if ($IsWeekly) {
+            $WeeklyMarkedCount++
+        }
+
+        if ($IsMonthly) {
+            $MonthlyMarkedCount++
+        }
+
+        if ($IsRecent) {
+            $Recent.Add($Entry)
+        } else {
+            $Extra.Add($Entry)
+        }
+    }
+
+    return [pscustomobject]@{
+        Recent            = $Recent
+        Extra             = $Extra
+        WeeklyMarkedCount = $WeeklyMarkedCount
+        MonthlyMarkedCount = $MonthlyMarkedCount
+    }
+}
+
+function Format-RetentionSnapshotLine {
+    param($Entry)
+
+    if ($null -eq $Entry) {
+        return ''
+    }
+
+    $Line = "<code>$(Convert-ToHtmlSafe $Entry.Id)</code> | $(Convert-ToHtmlSafe $Entry.Time)"
+    if ($Entry.Size) {
+        $Line += " | $(Convert-ToHtmlSafe $Entry.Size)"
+    }
+
+    $Notes = Get-SnapshotNotesText -Entry $Entry
+    if ($Notes) {
+        $Line += " | $(Convert-ToHtmlSafe $Notes)"
+    }
+
+    return $Line
+}
+
 function Get-RetentionInfo {
     param([string[]]$Lines)
 
@@ -673,6 +748,12 @@ $SourceReadWarning = ($RawContent -match '(?im)Warning:\s+at least one source fi
 $RetentionInfo = Get-RetentionInfo -Lines $LogLines
 $KeptSnapshots = @($RetentionInfo.Kept)
 $RemovedSnapshots = @($RetentionInfo.Removed)
+$RetentionLayout = Get-RetentionLayout -Entries $KeptSnapshots
+$ConfiguredKeepLast = try { [int]$KEEP_LAST } catch { 0 }
+$ConfiguredKeepWeekly = try { [int]$KEEP_WEEKLY } catch { 0 }
+$ConfiguredKeepMonthly = try { [int]$KEEP_MONTHLY } catch { 0 }
+$LatestRecentSnapshot = if ($RetentionLayout.Recent.Count -gt 0) { $RetentionLayout.Recent[$RetentionLayout.Recent.Count - 1] } else { $null }
+$OldestProtectedExtraSnapshot = if ($RetentionLayout.Extra.Count -gt 0) { $RetentionLayout.Extra[0] } else { $null }
 $LatestKeptSnapshot = if ($KeptSnapshots.Count -gt 0) { $KeptSnapshots[$KeptSnapshots.Count - 1] } else { $null }
 $OldestKeptSnapshot = if ($KeptSnapshots.Count -gt 0) { $KeptSnapshots[0] } else { $null }
 
@@ -901,7 +982,11 @@ if ($IsBackup) {
     }
 
     if ($Snapshots -ne 'N/A') {
-        $Parts.Add("- <b>Ativos apos prune:</b> $(Convert-ToHtmlSafe $Snapshots)`n")
+        $Parts.Add("- <b>Mantidos apos a limpeza:</b> $(Convert-ToHtmlSafe $Snapshots)`n")
+    }
+
+    if ($ConfiguredKeepLast -gt 0 -or $ConfiguredKeepWeekly -gt 0 -or $ConfiguredKeepMonthly -gt 0) {
+        $Parts.Add("- <b>Camadas configuradas:</b> recentes $(Format-CountDisplay -Value $ConfiguredKeepLast) | semanas $(Format-CountDisplay -Value $ConfiguredKeepWeekly) | meses $(Format-CountDisplay -Value $ConfiguredKeepMonthly)`n")
     }
 
     if ($RetentionInfo.RemoveCount -gt 0) {
@@ -1015,33 +1100,39 @@ if ($IsBackup) {
 
     if ($RetentionInfo.Policy -ne 'N/A' -or $RetentionInfo.KeepCount -gt 0 -or $RetentionInfo.RemoveCount -gt 0 -or $Pruned -ne 'N/A') {
         $Parts.Add("`n<b>RETENCAO</b>`n")
+        if ($ConfiguredKeepLast -gt 0 -or $ConfiguredKeepWeekly -gt 0 -or $ConfiguredKeepMonthly -gt 0) {
+            $Parts.Add("- <b>Configurado:</b> ultimos $(Format-CountDisplay -Value $ConfiguredKeepLast) snapshot(s) | semanas $(Format-CountDisplay -Value $ConfiguredKeepWeekly) | meses $(Format-CountDisplay -Value $ConfiguredKeepMonthly)`n")
+        }
         if ($RetentionInfo.Policy -ne 'N/A') {
-            $Parts.Add("- <b>Politica aplicada:</b> $(Convert-ToHtmlSafe $RetentionInfo.Policy)`n")
+            $Parts.Add("- <b>Politica tecnica:</b> $(Convert-ToHtmlSafe $RetentionInfo.Policy)`n")
         }
         if ($Snapshots -ne 'N/A') {
-            $Parts.Add("- <b>Snapshots ativos:</b> $(Convert-ToHtmlSafe $Snapshots)`n")
+            $Parts.Add("- <b>Mantidos apos a limpeza:</b> $(Convert-ToHtmlSafe $Snapshots)`n")
         }
-        if ($null -ne $LatestKeptSnapshot) {
-            $LatestNotes = Get-SnapshotNotesText -Entry $LatestKeptSnapshot
-            $LatestLine = "<code>$(Convert-ToHtmlSafe $LatestKeptSnapshot.Id)</code> | $(Convert-ToHtmlSafe $LatestKeptSnapshot.Time)"
-            if ($LatestKeptSnapshot.Size) {
-                $LatestLine += " | $(Convert-ToHtmlSafe $LatestKeptSnapshot.Size)"
-            }
-            if ($LatestNotes) {
-                $LatestLine += " | $(Convert-ToHtmlSafe $LatestNotes)"
-            }
-            $Parts.Add("- <b>Mais recente mantido:</b> $LatestLine`n")
+        if ($RetentionLayout.Recent.Count -gt 0) {
+            $Parts.Add("- <b>Dentro da janela recente:</b> $(Format-CountDisplay -Value $RetentionLayout.Recent.Count)`n")
         }
-        if ($null -ne $OldestKeptSnapshot -and $null -ne $LatestKeptSnapshot -and $OldestKeptSnapshot.Id -ne $LatestKeptSnapshot.Id) {
-            $OldestNotes = Get-SnapshotNotesText -Entry $OldestKeptSnapshot
-            $OldestLine = "<code>$(Convert-ToHtmlSafe $OldestKeptSnapshot.Id)</code> | $(Convert-ToHtmlSafe $OldestKeptSnapshot.Time)"
-            if ($OldestKeptSnapshot.Size) {
-                $OldestLine += " | $(Convert-ToHtmlSafe $OldestKeptSnapshot.Size)"
-            }
-            if ($OldestNotes) {
-                $OldestLine += " | $(Convert-ToHtmlSafe $OldestNotes)"
-            }
-            $Parts.Add("- <b>Mais antigo mantido:</b> $OldestLine`n")
+        if ($RetentionLayout.WeeklyMarkedCount -gt 0 -or $ConfiguredKeepWeekly -gt 0) {
+            $Parts.Add("- <b>Marcados pela regra semanal:</b> $(Format-CountDisplay -Value $RetentionLayout.WeeklyMarkedCount)`n")
+        }
+        if ($RetentionLayout.MonthlyMarkedCount -gt 0 -or $ConfiguredKeepMonthly -gt 0) {
+            $Parts.Add("- <b>Marcados pela regra mensal:</b> $(Format-CountDisplay -Value $RetentionLayout.MonthlyMarkedCount)`n")
+        }
+        if ($RetentionLayout.Extra.Count -gt 0) {
+            $Parts.Add("- <b>Extras preservados por semana/mes:</b> $(Format-CountDisplay -Value $RetentionLayout.Extra.Count)`n")
+        } elseif ($ConfiguredKeepWeekly -gt 0 -or $ConfiguredKeepMonthly -gt 0) {
+            $Parts.Add("- <b>Extras preservados por semana/mes:</b> nenhum nesta execucao; a janela recente ja cobriu essas camadas`n")
+        }
+        if ($null -ne $LatestRecentSnapshot) {
+            $Parts.Add("- <b>Mais novo na janela recente:</b> $(Format-RetentionSnapshotLine -Entry $LatestRecentSnapshot)`n")
+        } elseif ($null -ne $LatestKeptSnapshot) {
+            $Parts.Add("- <b>Mais novo mantido:</b> $(Format-RetentionSnapshotLine -Entry $LatestKeptSnapshot)`n")
+        }
+        if ($null -ne $OldestProtectedExtraSnapshot) {
+            $Parts.Add("- <b>Mais antigo ainda protegido fora da janela recente:</b> $(Format-RetentionSnapshotLine -Entry $OldestProtectedExtraSnapshot)`n")
+        }
+        if ($null -ne $OldestKeptSnapshot -and $null -ne $LatestKeptSnapshot -and $OldestKeptSnapshot.Id -ne $LatestKeptSnapshot.Id -and $null -eq $OldestProtectedExtraSnapshot) {
+            $Parts.Add("- <b>Mais antigo mantido:</b> $(Format-RetentionSnapshotLine -Entry $OldestKeptSnapshot)`n")
         }
         if ($RetentionInfo.RemoveCount -gt 0) {
             $Parts.Add("- <b>Removidos:</b> $(Format-CountDisplay -Value $RetentionInfo.RemoveCount)`n")

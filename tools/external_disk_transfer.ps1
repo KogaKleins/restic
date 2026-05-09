@@ -17,7 +17,9 @@ param(
     [string]$DestinationPasswordFile = '',
     [switch]$RefreshRecoveryKit,
     [string]$SnapshotId = 'latest',
-    [string]$RestoreTargetFolderName = ''
+    [string]$RestoreTargetFolderName = '',
+    [switch]$VerifyRestore,
+    [switch]$CleanRestoreTarget
 )
 
 Set-StrictMode -Version Latest
@@ -73,6 +75,44 @@ function Invoke-ExternalCommand {
     if ($ExitCode -ne 0) {
         throw "Comando externo retornou codigo $ExitCode"
     }
+}
+
+function Test-DirectoryHasItems {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    return $null -ne (Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Select-Object -First 1)
+}
+
+function Write-RestoreStatusFile {
+    param(
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$SnapshotId,
+        [Parameter(Mandatory)][bool]$Verified,
+        [string]$RepositoryPath = '',
+        [int]$ExitCode = 0,
+        [string]$Details = ''
+    )
+
+    $Lines = @(
+        ('status={0}' -f $Status)
+        ('timestamp={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+        ('snapshot={0}' -f $SnapshotId)
+        ('verified={0}' -f $Verified)
+        ('repository={0}' -f $RepositoryPath)
+        ('target={0}' -f $TargetPath)
+        ('exit_code={0}' -f $ExitCode)
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        $Lines += ('details={0}' -f $Details)
+    }
+
+    Set-Content -LiteralPath (Join-Path $TargetPath '_restore_status.txt') -Value $Lines -Encoding UTF8
 }
 
 $NormalizedDriveLetter = Get-NormalizedDriveLetter -InputDriveLetter $DriveLetter
@@ -172,6 +212,16 @@ if ($Mode -eq 'RestoreAll') {
         New-Item -ItemType Directory -Path $RestoreTargetPath -Force | Out-Null
     }
 
+    if (Test-DirectoryHasItems -Path $RestoreTargetPath) {
+        if ($CleanRestoreTarget) {
+            if ($PSCmdlet.ShouldProcess($RestoreTargetPath, 'Limpar conteudo anterior do restore')) {
+                Get-ChildItem -LiteralPath $RestoreTargetPath -Force -ErrorAction Stop | Remove-Item -Recurse -Force
+            }
+        } else {
+            throw 'A pasta de restore ja contem arquivos. Use outro nome de pasta ou habilite a limpeza da pasta existente antes de restaurar novamente.'
+        }
+    }
+
     $RestoreArgs = @(
         'restore'
         $SnapshotId
@@ -181,15 +231,22 @@ if ($Mode -eq 'RestoreAll') {
         $EffectiveDestinationPasswordFile
         '--target'
         $RestoreTargetPath
-        '--verify'
     )
 
+    if ($VerifyRestore) {
+        $RestoreArgs += '--verify'
+    }
+
     if ($PSCmdlet.ShouldProcess($RestoreTargetPath, 'Desempacotar snapshot completo no disco externo')) {
+        Write-RestoreStatusFile -TargetPath $RestoreTargetPath -Status 'running' -SnapshotId $SnapshotId -Verified:$VerifyRestore -RepositoryPath $RepositoryPath -Details 'Restore em andamento.'
         & $RESTIC_EXE @RestoreArgs
         $RestoreExitCode = $LASTEXITCODE
         if ($RestoreExitCode -ne 0) {
+            Write-RestoreStatusFile -TargetPath $RestoreTargetPath -Status 'incomplete' -SnapshotId $SnapshotId -Verified:$VerifyRestore -RepositoryPath $RepositoryPath -ExitCode $RestoreExitCode -Details 'Restore interrompido ou finalizado com erro. O conteudo parcial foi preservado para avaliacao manual.'
             throw "Falha ao restaurar snapshot completo. ExitCode: $RestoreExitCode"
         }
+
+        Write-RestoreStatusFile -TargetPath $RestoreTargetPath -Status 'completed' -SnapshotId $SnapshotId -Verified:$VerifyRestore -RepositoryPath $RepositoryPath -Details 'Restore concluido com sucesso.'
     }
 }
 

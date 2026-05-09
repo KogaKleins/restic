@@ -27,6 +27,7 @@ $RootFilesToCopy = @(
     'check.bat'
     'sincronizar_externo.bat'
     'ativar_agora.bat'
+    'centro_de_controle.bat'
     'configurar.bat'
     'preparar_distribuicao.bat'
     '.gitignore'

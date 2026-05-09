@@ -22,6 +22,7 @@ $BackupNowBat = Join-Path $ProjectRoot 'ativar_agora.bat'
 $BackupTaskBat = Join-Path $ProjectRoot 'backup.bat'
 $CheckTaskBat = Join-Path $ProjectRoot 'check.bat'
 $ExternalSyncBat = Join-Path $ProjectRoot 'sincronizar_externo.bat'
+$RetentionLayoutScript = Join-Path $ProjectRoot 'tools\show_retention_layout.ps1'
 $RestoreScript = Join-Path $ProjectRoot 'tools\restore_snapshot.ps1'
 $ExportSnapshotsScript = Join-Path $ProjectRoot 'tools\export_active_snapshots.ps1'
 $ExternalDiskTransferScript = Join-Path $ProjectRoot 'tools\external_disk_transfer.ps1'
@@ -39,6 +40,46 @@ function Read-MenuPause {
     Read-Host 'Pressione Enter para voltar ao menu' | Out-Null
 }
 
+function Show-FlowHeader {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Goal,
+        [string[]]$Bullets = @(),
+        [switch]$ClearScreen
+    )
+
+    if ($ClearScreen) {
+        Clear-Host
+    }
+
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host (" {0}" -f $Title) -ForegroundColor Cyan
+    Write-Host '=========================================================' -ForegroundColor Cyan
+    Write-Host $Goal -ForegroundColor DarkCyan
+
+    if ($Bullets.Count -gt 0) {
+        Write-Host ''
+        foreach ($Bullet in $Bullets) {
+            Write-Host ("- {0}" -f $Bullet)
+        }
+    }
+
+    Write-Host ''
+}
+
+function Show-KeyValueSummary {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][hashtable]$Pairs
+    )
+
+    Write-Host $Title -ForegroundColor Cyan
+    foreach ($Key in $Pairs.Keys) {
+        Write-Host ("- {0}: {1}" -f $Key, $Pairs[$Key])
+    }
+    Write-Host ''
+}
+
 function Show-InputTips {
     param([string]$ExtraHint = '')
 
@@ -47,6 +88,24 @@ function Show-InputTips {
         Write-Host $ExtraHint -ForegroundColor DarkCyan
     }
     Write-Host ''
+}
+
+function Get-ComparableText {
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
+
+    $Decomposed = $Text.Trim().ToLowerInvariant().Normalize([Text.NormalizationForm]::FormD)
+    $Builder = New-Object System.Text.StringBuilder
+    foreach ($Character in $Decomposed.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($Character) -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$Builder.Append($Character)
+        }
+    }
+
+    return $Builder.ToString().Normalize([Text.NormalizationForm]::FormC)
 }
 
 function Test-CancelKeyword {
@@ -116,6 +175,49 @@ function Get-MaskedToken {
     }
 
     if ($Token.Length -le 8) {
+
+    function Get-RestoreStatusLabel {
+        param([AllowNull()][string]$RawStatus)
+
+        switch ((Get-ComparableText -Text $RawStatus)) {
+            'completed' { return 'concluido com sucesso' }
+            'incomplete' { return 'incompleto ou interrompido' }
+            'running' { return 'em andamento ou interrompido sem fechamento' }
+            default {
+                if ([string]::IsNullOrWhiteSpace($RawStatus)) {
+                    return 'desconhecido'
+                }
+
+                return $RawStatus.Trim()
+            }
+        }
+    }
+
+    function Get-RestoreStatusInfo {
+        param([Parameter(Mandatory)][string]$TargetPath)
+
+        $StatusFilePath = Join-Path $TargetPath '_restore_status.txt'
+        if (-not (Test-Path -LiteralPath $StatusFilePath)) {
+            return $null
+        }
+
+        $Values = @{}
+        foreach ($Line in @(Get-Content -LiteralPath $StatusFilePath -Encoding UTF8 -ErrorAction Stop)) {
+            if ($Line -match '^\s*([^=]+)=(.*)$') {
+                $Values[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
+        }
+
+        return [pscustomobject]@{
+            StatusFilePath = $StatusFilePath
+            Status         = $Values['status']
+            Timestamp      = $Values['timestamp']
+            Snapshot       = $Values['snapshot']
+            Verified       = $Values['verified']
+            ExitCode       = $Values['exit_code']
+            Details        = $Values['details']
+        }
+    }
         return '********'
     }
 
@@ -235,10 +337,22 @@ function Read-TimeText {
 }
 
 function Read-ScopeChoice {
-    param([string]$Current = 'User')
+    param(
+        [string]$Current = 'User',
+        [string]$Reason = 'esta configuracao',
+        [string]$Recommendation = 'User'
+    )
+
+    Write-Host ''
+    Write-Host 'Onde salvar esta alteracao?' -ForegroundColor Cyan
+    Write-Host ("- User: grava somente para o usuario atual ({0})." -f $env:USERNAME)
+    Write-Host '- Machine: grava para toda a maquina e costuma ser usado quando a tarefa roda em outra conta ou em SYSTEM.'
+    Write-Host ("- Isso vale para: {0}." -f $Reason) -ForegroundColor DarkCyan
+    Write-Host ("- Recomendado aqui: {0}." -f $Recommendation) -ForegroundColor DarkCyan
+    Write-Host ''
 
     while ($true) {
-        $Raw = Read-Host "Escopo para gravar variaveis [User/Machine] [$Current]"
+        $Raw = Read-Host ("Escolha o escopo final [User/Machine] [{0}]" -f $Current)
         Stop-IfCancelled -Value $Raw
 
         if ([string]::IsNullOrWhiteSpace($Raw)) {
@@ -393,7 +507,13 @@ function Select-ExternalDiskCandidate {
     Write-Host '[0] Voltar'
 
     while ($true) {
-        $Raw = Read-Host ("Escolha o disco externo para a transferencia {0}" -f $(if ($Mode -eq 'Initial') { 'inicial' } else { 'semanal' }))
+        $ActionLabel = switch ($Mode) {
+            'Initial' { 'inicial' }
+            'Weekly' { 'semanal' }
+            'RestoreAll' { 'de restore completo' }
+        }
+
+        $Raw = Read-Host ("Escolha o disco externo para a operacao {0}" -f $ActionLabel)
         if ($Raw -eq '0') {
             throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
         }
@@ -440,7 +560,7 @@ function Save-ExternalDiskAsDefault {
 
     $Current = Get-CurrentConfig
     $Current.ExportRepository = $RepositoryPath
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_EXPORT_REPOSITORY', 'RESTIC_EXPORT_PASSWORD_FILE'))
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_EXPORT_REPOSITORY', 'RESTIC_EXPORT_PASSWORD_FILE')) -Reason 'destino padrao do espelho externo' -Recommendation 'User, a menos que o backup rode em outra conta ou em SYSTEM'
     Update-ConfigState -Config $Current -Scope $Scope
     Write-Host '[OK] Destino externo salvo como padrao.' -ForegroundColor Green
 }
@@ -463,11 +583,12 @@ function Get-DayLabel {
 function Resolve-DayNameInput {
     param([string]$InputText)
 
-    if ([string]::IsNullOrWhiteSpace($InputText)) {
+    $ComparableText = Get-ComparableText -Text $InputText
+    if ([string]::IsNullOrWhiteSpace($ComparableText)) {
         return $null
     }
 
-    switch ($InputText.Trim().ToLowerInvariant()) {
+    switch ($ComparableText) {
         'domingo' { return 'Sunday' }
         'dom' { return 'Sunday' }
         'sunday' { return 'Sunday' }
@@ -478,9 +599,7 @@ function Resolve-DayNameInput {
         'monday' { return 'Monday' }
 
         'terca' { return 'Tuesday' }
-        'terça' { return 'Tuesday' }
         'terca-feira' { return 'Tuesday' }
-        'terça-feira' { return 'Tuesday' }
         'ter' { return 'Tuesday' }
         'tuesday' { return 'Tuesday' }
 
@@ -500,7 +619,6 @@ function Resolve-DayNameInput {
         'friday' { return 'Friday' }
 
         'sabado' { return 'Saturday' }
-        'sábado' { return 'Saturday' }
         'sab' { return 'Saturday' }
         'saturday' { return 'Saturday' }
 
@@ -891,9 +1009,9 @@ function Show-ConfigDashboard {
 
     Write-Host 'RETENCAO' -ForegroundColor Cyan
     Write-Host '--------' -ForegroundColor Cyan
-    Write-Host ("- Ultimos snapshots: {0}" -f $Config.KeepLast)
-    Write-Host ("- Semanais: {0}" -f $Config.KeepWeekly)
-    Write-Host ("- Mensais: {0}" -f $Config.KeepMonthly)
+    Write-Host ("- Janela recente: {0}" -f $Config.KeepLast)
+    Write-Host ("- Semanas protegidas: {0}" -f $Config.KeepWeekly)
+    Write-Host ("- Meses protegidos: {0}" -f $Config.KeepMonthly)
     Write-Host ("  origem: {0}" -f $RetentionSetting.Scope) -ForegroundColor DarkCyan
     Write-Host ''
 
@@ -1032,6 +1150,10 @@ function Select-ProfileName {
 }
 
 function Export-CurrentProfile {
+    Show-FlowHeader -Title 'SALVAR PERFIL' -Goal 'Salva uma foto da configuracao atual para reaplicar depois com poucos cliques.' -Bullets @(
+        'use perfis para separar cenarios como casa, trabalho ou cliente A'
+    ) -ClearScreen
+
     Show-InputTips
 
     $Current = Get-CurrentConfig
@@ -1045,15 +1167,23 @@ function Export-CurrentProfile {
 }
 
 function Update-ProfileFromStore {
+    Show-FlowHeader -Title 'APLICAR PERFIL' -Goal 'Substitui a configuracao atual pelas configuracoes salvas em um perfil.' -Bullets @(
+        'isso troca caminhos, retencao, Telegram, fontes e exclusoes conforme o perfil escolhido'
+    ) -ClearScreen
+
     $ProfileName = Select-ProfileName -Prompt 'Escolha o numero do perfil para aplicar'
     $Profiles = Get-ProfilesStore
     $SelectedProfile = $Profiles.profiles.$ProfileName
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_REPOSITORY', 'RESTIC_LOG_DIR'))
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_REPOSITORY', 'RESTIC_LOG_DIR')) -Reason ('aplicar o perfil salvo "{0}"' -f $ProfileName) -Recommendation 'User, a menos que o perfil precise valer para tarefas em outra conta ou em SYSTEM'
     Update-ConfigState -Config $SelectedProfile -Scope $Scope
     Write-Host "[OK] Perfil aplicado: $ProfileName" -ForegroundColor Green
 }
 
 function Remove-ProfileFromStore {
+    Show-FlowHeader -Title 'REMOVER PERFIL' -Goal 'Remove um perfil salvo que nao sera mais usado.' -Bullets @(
+        'isso nao altera a configuracao atual da maquina; apenas remove o perfil salvo do catalogo local'
+    ) -ClearScreen
+
     $ProfileName = Select-ProfileName -Prompt 'Numero do perfil para remover'
     $Profiles = Get-ProfilesStore
     $Confirm = Read-YesNo -Prompt ("Confirmar remocao do perfil '{0}'?" -f $ProfileName) -Default $false
@@ -1073,9 +1203,14 @@ function Show-ProfileMenu {
         Write-Host '=========================================================' -ForegroundColor Cyan
         Write-Host ' PERFIS DE CONFIGURACAO' -ForegroundColor Cyan
         Write-Host '=========================================================' -ForegroundColor Cyan
+        Write-Host 'Use perfis para guardar configuracoes completas e alternar entre cenarios rapidamente.' -ForegroundColor DarkCyan
+        Write-Host ''
         Write-Host '[1] Salvar configuracao atual como perfil'
+        Write-Host '    Guarda o estado atual para reaplicar depois.' -ForegroundColor DarkCyan
         Write-Host '[2] Aplicar perfil salvo'
+        Write-Host '    Troca a configuracao atual pela de um perfil salvo.' -ForegroundColor DarkCyan
         Write-Host '[3] Remover perfil salvo'
+        Write-Host '    Exclui um perfil que nao sera mais usado.' -ForegroundColor DarkCyan
         Write-Host '[0] Voltar ao menu principal'
         Write-Host ''
 
@@ -1121,68 +1256,154 @@ function Show-ProfileMenu {
 }
 
 function Update-TelegramSettings {
-    Show-InputTips -ExtraHint 'Use - para limpar token/chat e desativar notificacoes.'
-
     $Current = Get-CurrentConfig
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_TELEGRAM_TOKEN', 'RESTIC_TELEGRAM_CHATID'))
 
-    $Current.TelegramToken = Read-Text -Prompt 'RESTIC_TELEGRAM_TOKEN' -Default $Current.TelegramToken -AllowClear
-    $Current.TelegramChatId = Read-Text -Prompt 'RESTIC_TELEGRAM_CHATID' -Default $Current.TelegramChatId -AllowClear
+    Show-FlowHeader -Title 'TELEGRAM' -Goal 'Configura para onde o sistema envia notificacoes de backup e check.' -Bullets @(
+        'preencha token e chat para ativar notificacoes',
+        'use - para limpar um valor e desativar o envio'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'Primeiro voce ajusta token/chat. Depois o sistema pergunta onde gravar essa configuracao.'
+
+    Show-KeyValueSummary -Title 'Estado atual:' -Pairs ([ordered]@{
+        'Status' = $(if ([string]::IsNullOrWhiteSpace($Current.TelegramToken) -or [string]::IsNullOrWhiteSpace($Current.TelegramChatId)) { 'incompleto ou desativado' } else { 'ativo' })
+        'Token' = (Get-MaskedToken -Token $Current.TelegramToken)
+        'Chat ID' = $(if ($Current.TelegramChatId) { $Current.TelegramChatId } else { '(nao configurado)' })
+    })
+
+    $Current.TelegramToken = Read-Text -Prompt 'Token do bot (RESTIC_TELEGRAM_TOKEN)' -Default $Current.TelegramToken -AllowClear
+    $Current.TelegramChatId = Read-Text -Prompt 'Chat ID de destino (RESTIC_TELEGRAM_CHATID)' -Default $Current.TelegramChatId -AllowClear
+
+    Show-KeyValueSummary -Title 'Resumo que sera gravado:' -Pairs ([ordered]@{
+        'Token' = (Get-MaskedToken -Token $Current.TelegramToken)
+        'Chat ID' = $(if ($Current.TelegramChatId) { $Current.TelegramChatId } else { '(vazio)' })
+    })
+
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_TELEGRAM_TOKEN', 'RESTIC_TELEGRAM_CHATID')) -Reason 'token e chat do Telegram para notificacoes' -Recommendation 'User, se o backup roda na sua conta; Machine se as tarefas rodam em outra conta ou em SYSTEM'
 
     Update-ConfigState -Config $Current -Scope $Scope
-    Write-Host '[OK] Telegram atualizado.' -ForegroundColor Green
+    Write-Host ("[OK] Telegram atualizado em {0}." -f $Scope) -ForegroundColor Green
 }
 
 function Update-RetentionSettings {
-    Show-InputTips
-    Write-Host 'Explicacao rapida:' -ForegroundColor Cyan
-    Write-Host '- keep-last: snapshots mais recentes preservados independentemente da idade'
-    Write-Host '- keep-weekly: 1 snapshot por semana'
-    Write-Host '- keep-monthly: 1 snapshot por mes'
-    Write-Host ''
-
     $Current = Get-CurrentConfig
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_KEEP_LAST', 'RESTIC_KEEP_WEEKLY', 'RESTIC_KEEP_MONTHLY'))
 
-    $Current.KeepLast = Read-Number -Prompt 'RESTIC_KEEP_LAST' -Default ([int]$Current.KeepLast) -MinValue 1
-    $Current.KeepWeekly = Read-Number -Prompt 'RESTIC_KEEP_WEEKLY' -Default ([int]$Current.KeepWeekly) -MinValue 0
-    $Current.KeepMonthly = Read-Number -Prompt 'RESTIC_KEEP_MONTHLY' -Default ([int]$Current.KeepMonthly) -MinValue 0
+    Show-FlowHeader -Title 'RETENCAO E SNAPSHOTS' -Goal 'Aqui voce define a politica que o Restic usa para decidir quais snapshots continuam valendo e quais podem ser removidos.' -Bullets @(
+        'keep-last = guarda os N snapshots mais recentes',
+        'keep-weekly = tambem guarda 1 snapshot representativo por semana nas ultimas N semanas',
+        'keep-monthly = tambem guarda 1 snapshot representativo por mes nos ultimos N meses',
+        'essas regras sao combinadas: um snapshot e mantido se bater em qualquer regra',
+        'por isso o total final pode ser maior que keep-last',
+        'se voce quer somente os ultimos N snapshots, deixe keep-weekly = 0 e keep-monthly = 0',
+        'essas regras entram em acao nas proximas execucoes do backup, quando o forget/prune for aplicado'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'Primeiro voce ajusta os valores. Depois o sistema pergunta onde gravar essa politica.'
+
+    Show-KeyValueSummary -Title 'Politica atual:' -Pairs @{
+        'Janela recente (keep-last)' = [string]$Current.KeepLast
+        'Semanas protegidas (keep-weekly)' = [string]$Current.KeepWeekly
+        'Meses protegidos (keep-monthly)' = [string]$Current.KeepMonthly
+    }
+
+    $Current.KeepLast = Read-Number -Prompt 'Quantos snapshots recentes manter (keep-last)' -Default ([int]$Current.KeepLast) -MinValue 1
+    $Current.KeepWeekly = Read-Number -Prompt 'Quantas semanas manter representadas (keep-weekly)' -Default ([int]$Current.KeepWeekly) -MinValue 0
+    $Current.KeepMonthly = Read-Number -Prompt 'Quantos meses manter representados (keep-monthly)' -Default ([int]$Current.KeepMonthly) -MinValue 0
+
+    Show-KeyValueSummary -Title 'Resumo que sera gravado:' -Pairs @{
+        'Janela recente (keep-last)' = [string]$Current.KeepLast
+        'Semanas protegidas (keep-weekly)' = [string]$Current.KeepWeekly
+        'Meses protegidos (keep-monthly)' = [string]$Current.KeepMonthly
+    }
+
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_KEEP_LAST', 'RESTIC_KEEP_WEEKLY', 'RESTIC_KEEP_MONTHLY')) -Reason 'politica de retencao de snapshots do backup' -Recommendation 'User, a menos que suas tarefas rodem em outra conta ou em SYSTEM'
 
     Update-ConfigState -Config $Current -Scope $Scope
-    Write-Host '[OK] Retencao atualizada.' -ForegroundColor Green
+    Write-Host ("[OK] Retencao atualizada em {0}." -f $Scope) -ForegroundColor Green
+}
+
+function Show-RetentionLayoutPreview {
+    if (-not (Test-Path -LiteralPath $RetentionLayoutScript)) {
+        Write-Warning "Visualizador de retencao nao encontrado: $RetentionLayoutScript"
+        return
+    }
+
+    Show-FlowHeader -Title 'SNAPSHOTS MANTIDOS PELA POLITICA' -Goal 'Mostra como a politica atual preserva os snapshots se a limpeza rodasse agora.' -Bullets @(
+        'a ordem exibida e: recentes, semanais extras, mensais extras',
+        'isso nao altera o repositorio; o comando roda em modo dry-run'
+    ) -ClearScreen
+
+    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $RetentionLayoutScript
+    $PreviewExitCode = $LASTEXITCODE
+    if ($PreviewExitCode -ne 0) {
+        throw "Visualizacao da retencao retornou codigo $PreviewExitCode"
+    }
 }
 
 function Update-PathSettings {
-    Show-InputTips -ExtraHint 'Use - para limpar o destino externo e a senha externa, se quiser desativar o espelhamento.'
-
     $Current = Get-CurrentConfig
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_EXE', 'RESTIC_REPOSITORY', 'RESTIC_PASSWORD_FILE', 'RESTIC_LOG_DIR', 'RESTIC_EXPORT_REPOSITORY', 'RESTIC_EXPORT_PASSWORD_FILE'))
 
-    $Current.ResticExe = Read-Text -Prompt 'RESTIC_EXE' -Default $Current.ResticExe
-    $Current.Repository = Read-Text -Prompt 'RESTIC_REPOSITORY' -Default $Current.Repository
-    $Current.SecretFilePath = Read-Text -Prompt 'RESTIC_PASSWORD_FILE' -Default $Current.SecretFilePath
-    $Current.LogDir = Read-Text -Prompt 'RESTIC_LOG_DIR' -Default $Current.LogDir
-    $Current.LogKeepDays = Read-Number -Prompt 'RESTIC_LOG_KEEP_DAYS' -Default ([int]$Current.LogKeepDays) -MinValue 1
-    $Current.ExportRepository = Read-Text -Prompt 'RESTIC_EXPORT_REPOSITORY' -Default $Current.ExportRepository -AllowClear
-    $Current.ExportPasswordFile = Read-Text -Prompt 'RESTIC_EXPORT_PASSWORD_FILE' -Default $Current.ExportPasswordFile -AllowClear
+    Show-FlowHeader -Title 'CAMINHOS PRINCIPAIS E ESPELHO EXTERNO' -Goal 'Define os caminhos base do projeto: executavel, repositorio, senha, logs e o destino padrao opcional do HD externo.' -Bullets @(
+        'o repositorio principal e obrigatorio para backup e restore',
+        'o destino padrao externo so e necessario se voce quiser deixar pronto o espelho externo semanal automatico',
+        'se voce pretende conectar o HD e escolher tudo manualmente no menu, pode deixar esse campo vazio',
+        'use - para limpar somente os campos do espelho externo'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'Primeiro voce ajusta os caminhos. Depois o sistema pergunta onde gravar essa configuracao.'
+
+    Show-KeyValueSummary -Title 'Configuracao atual:' -Pairs ([ordered]@{
+        'Executavel do Restic' = $(if ($Current.ResticExe) { $Current.ResticExe } else { '(nao configurado)' })
+        'Repositorio principal' = $(if ($Current.Repository) { $Current.Repository } else { '(nao configurado)' })
+        'Arquivo de senha' = $(if ($Current.SecretFilePath) { $Current.SecretFilePath } else { '(nao configurado)' })
+        'Pasta de logs' = $(if ($Current.LogDir) { $Current.LogDir } else { '(nao configurado)' })
+        'Dias de log' = [string]$Current.LogKeepDays
+        'Destino padrao no HD externo' = $(if ($Current.ExportRepository) { $Current.ExportRepository } else { '(nao configurado)' })
+        'Senha do repo externo' = $(if ($Current.ExportPasswordFile) { $Current.ExportPasswordFile } else { 'usa RESTIC_PASSWORD_FILE atual' })
+    })
+
+    $Current.ResticExe = Read-Text -Prompt 'Executavel do Restic (RESTIC_EXE)' -Default $Current.ResticExe
+    $Current.Repository = Read-Text -Prompt 'Repositorio principal (RESTIC_REPOSITORY)' -Default $Current.Repository
+    $Current.SecretFilePath = Read-Text -Prompt 'Arquivo de senha (RESTIC_PASSWORD_FILE)' -Default $Current.SecretFilePath
+    $Current.LogDir = Read-Text -Prompt 'Pasta de logs (RESTIC_LOG_DIR)' -Default $Current.LogDir
+    $Current.LogKeepDays = Read-Number -Prompt 'Dias de retencao dos logs (RESTIC_LOG_KEEP_DAYS)' -Default ([int]$Current.LogKeepDays) -MinValue 1
+    $Current.ExportRepository = Read-Text -Prompt 'Destino padrao do HD externo (RESTIC_EXPORT_REPOSITORY)' -Default $Current.ExportRepository -AllowClear
+    $Current.ExportPasswordFile = Read-Text -Prompt 'Arquivo de senha do repo externo (RESTIC_EXPORT_PASSWORD_FILE)' -Default $Current.ExportPasswordFile -AllowClear
+
+    Show-KeyValueSummary -Title 'Resumo que sera gravado:' -Pairs ([ordered]@{
+        'Executavel do Restic' = $Current.ResticExe
+        'Repositorio principal' = $Current.Repository
+        'Arquivo de senha' = $Current.SecretFilePath
+        'Pasta de logs' = $Current.LogDir
+        'Dias de log' = [string]$Current.LogKeepDays
+        'Destino padrao no HD externo' = $(if ($Current.ExportRepository) { $Current.ExportRepository } else { '(vazio)' })
+        'Senha do repo externo' = $(if ($Current.ExportPasswordFile) { $Current.ExportPasswordFile } else { '(vazio / herdar senha principal)' })
+    })
+
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_EXE', 'RESTIC_REPOSITORY', 'RESTIC_PASSWORD_FILE', 'RESTIC_LOG_DIR', 'RESTIC_EXPORT_REPOSITORY', 'RESTIC_EXPORT_PASSWORD_FILE')) -Reason 'caminhos principais do backup e do espelho externo' -Recommendation 'User, a menos que as tarefas rodem em outra conta ou em SYSTEM'
 
     Update-ConfigState -Config $Current -Scope $Scope
-    Write-Host '[OK] Caminhos principais e espelho externo atualizados.' -ForegroundColor Green
+    Write-Host ("[OK] Caminhos principais e espelho externo atualizados em {0}." -f $Scope) -ForegroundColor Green
 }
 
 function Update-BackupSourceSettings {
-    Show-InputTips -ExtraHint 'Use ; para separar varios caminhos ou regras. Use - para limpar exclusoes.'
-
     $Current = Get-CurrentConfig
+
+    Show-FlowHeader -Title 'FONTES E EXCLUSOES DO BACKUP' -Goal 'Define o que entra no backup e o que fica de fora.' -Bullets @(
+        'separe varios caminhos com ;',
+        'as exclusoes aceitam pastas e padroes como *.tmp',
+        'use - para limpar a lista de exclusoes'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'Primeiro voce ajusta as listas. Depois o sistema pergunta onde gravar essa configuracao.'
+
     Show-StringList -Title ("Fontes atuais ({0})" -f $Current.BackupSources.Count) -Items $Current.BackupSources
     Write-Host ''
     Show-StringList -Title ("Exclusoes atuais ({0})" -f $Current.BackupExcludes.Count) -Items $Current.BackupExcludes
     Write-Host ''
 
-    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_BACKUP_SOURCES', 'RESTIC_BACKUP_EXCLUDES'))
-
-    $SourcesRaw = Read-Text -Prompt 'RESTIC_BACKUP_SOURCES (; separado)' -Default ($Current.BackupSources -join ';')
-    $ExcludesRaw = Read-Text -Prompt 'RESTIC_BACKUP_EXCLUDES (; separado)' -Default ($Current.BackupExcludes -join ';') -AllowClear
+    $SourcesRaw = Read-Text -Prompt 'Fontes de backup (RESTIC_BACKUP_SOURCES | ; separado)' -Default ($Current.BackupSources -join ';')
+    $ExcludesRaw = Read-Text -Prompt 'Exclusoes do backup (RESTIC_BACKUP_EXCLUDES | ; separado)' -Default ($Current.BackupExcludes -join ';') -AllowClear
 
     $Current.BackupSources = @($SourcesRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $Current.BackupExcludes = @($ExcludesRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1191,8 +1412,15 @@ function Update-BackupSourceSettings {
         throw 'Pelo menos uma fonte de backup e obrigatoria.'
     }
 
+    Show-StringList -Title ("Fontes que serao gravadas ({0})" -f $Current.BackupSources.Count) -Items $Current.BackupSources
+    Write-Host ''
+    Show-StringList -Title ("Exclusoes que serao gravadas ({0})" -f $Current.BackupExcludes.Count) -Items $Current.BackupExcludes
+    Write-Host ''
+
+    $Scope = Read-ScopeChoice -Current (Get-DefaultWritableScope -Names @('RESTIC_BACKUP_SOURCES', 'RESTIC_BACKUP_EXCLUDES')) -Reason 'fontes e exclusoes do backup' -Recommendation 'User, a menos que o backup rode em outra conta ou em SYSTEM'
+
     Update-ConfigState -Config $Current -Scope $Scope
-    Write-Host '[OK] Fontes e exclusoes atualizadas.' -ForegroundColor Green
+    Write-Host ("[OK] Fontes e exclusoes atualizadas em {0}." -f $Scope) -ForegroundColor Green
 }
 
 function Remove-CheckTaskIfRequested {
@@ -1243,7 +1471,15 @@ function Update-ScheduleSettings {
     $ExportSummary = Get-ScheduledTaskSummary -Kind 'Export'
     $Config = Get-CurrentConfig
 
-    Show-InputTips -ExtraHint 'Nesta tela voce pode alterar horario do backup e criar/ajustar o check semanal e o espelho externo.'
+    Show-FlowHeader -Title 'AGENDAMENTO' -Goal 'Aqui voce ajusta quando as tarefas automaticas rodam no Windows.' -Bullets @(
+        'backup = copia seus dados para o repositorio principal',
+        'check = verifica a integridade do repositorio',
+        'espelho externo = atualiza o segundo repositorio Restic que fica no HD externo',
+        'isso so precisa de destino salvo quando voce quer automatizar a rotina semanal'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'No fim desta tela, o sistema mostra um resumo completo antes de aplicar o novo agendamento.'
+
     Write-Host 'Agendamento atual:' -ForegroundColor Cyan
     if ($BackupSummary.Exists) {
         Write-Host ("- Backup: {0}" -f $BackupSummary.Summary)
@@ -1261,16 +1497,17 @@ function Update-ScheduleSettings {
     if ($ExportSummary.Exists) {
         Write-Host ("- Espelho externo: {0}" -f $ExportSummary.Summary)
     } elseif ([string]::IsNullOrWhiteSpace($Config.ExportRepository)) {
-        Write-Host '- Espelho externo: destino nao configurado; a tarefa semanal ficara desabilitada ate configurar RESTIC_EXPORT_REPOSITORY.' -ForegroundColor Yellow
+        Write-Host '- Espelho externo: sem destino padrao salvo; a tarefa automatica semanal fica desabilitada ate configurar RESTIC_EXPORT_REPOSITORY.' -ForegroundColor Yellow
+        Write-Host '- Uso manual continua disponivel no menu de disco externo, escolhendo o HD na hora.' -ForegroundColor DarkCyan
     } else {
         Write-Host '- Espelho externo: nao existe tarefa semanal hoje.' -ForegroundColor Yellow
     }
     Write-Host ''
 
     $BackupTime = Read-TimeText -Prompt 'Horario diario do backup (HH:mm)' -Default $BackupSummary.Time
-    $BackupDaysInterval = Read-Number -Prompt 'Intervalo do backup em dias' -Default ([int]$BackupSummary.DaysInterval) -MinValue 1
-    $ConfigureCheck = Read-YesNo -Prompt 'Deseja configurar/manter o check semanal?' -Default $CheckSummary.Exists
-    $ConfigureExport = Read-YesNo -Prompt 'Deseja configurar/manter o espelho externo semanal?' -Default ($ExportSummary.Exists -or (-not [string]::IsNullOrWhiteSpace($Config.ExportRepository)))
+    $BackupDaysInterval = Read-Number -Prompt 'Executar backup a cada quantos dias' -Default ([int]$BackupSummary.DaysInterval) -MinValue 1
+    $ConfigureCheck = Read-YesNo -Prompt 'Deseja manter ou criar o check semanal?' -Default $CheckSummary.Exists
+    $ConfigureExport = Read-YesNo -Prompt 'Deseja manter ou criar o espelho externo semanal?' -Default ($ExportSummary.Exists -or (-not [string]::IsNullOrWhiteSpace($Config.ExportRepository)))
 
     $RegisterParams = @{
         InstallDir        = $ProjectRoot
@@ -1293,6 +1530,8 @@ function Update-ScheduleSettings {
     }
 
     if ($ConfigureCheck) {
+        Write-Host ''
+        Write-Host 'CHECK SEMANAL' -ForegroundColor Cyan
         $CheckDay = Read-CheckDayValue -DefaultDay $CheckSummary.CheckDay
 
         $CheckTime = Read-TimeText -Prompt 'Horario do check semanal (HH:mm)' -Default $CheckSummary.Time
@@ -1310,9 +1549,11 @@ function Update-ScheduleSettings {
 
     if ($ConfigureExport) {
         if ([string]::IsNullOrWhiteSpace($Config.ExportRepository)) {
-            throw 'Configure RESTIC_EXPORT_REPOSITORY em "Ajustar caminhos principais" antes de criar o espelho externo semanal.'
+            throw 'Salve primeiro o destino padrao do HD externo em "Caminhos principais e destino externo" antes de criar o espelho externo semanal.'
         }
 
+        Write-Host ''
+        Write-Host 'ESPELHO EXTERNO SEMANAL' -ForegroundColor Cyan
         $ExportDay = Read-CheckDayValue -DefaultDay $ExportSummary.WeekDay
         $ExportTime = Read-TimeText -Prompt 'Horario do espelho externo semanal (HH:mm)' -Default $ExportSummary.Time
         $ExportWeeksInterval = Read-Number -Prompt 'Intervalo do espelho externo em semanas' -Default ([int]$ExportSummary.WeeksInterval) -MinValue 1
@@ -1322,6 +1563,19 @@ function Update-ScheduleSettings {
         $RegisterParams.ExportTime = $ExportTime
         $RegisterParams.ExportWeeksInterval = $ExportWeeksInterval
         $RegisterParams.ExportTaskName = $ExportSummary.TaskName
+    }
+
+    Show-KeyValueSummary -Title 'Resumo que sera aplicado:' -Pairs ([ordered]@{
+        'Backup diario' = ("{0} | a cada {1} dia(s)" -f $BackupTime, $BackupDaysInterval)
+        'Check semanal' = $(if ($ConfigureCheck) { "{0} | {1} | modo {2} | a cada {3} semana(s)" -f $CheckTime, (Get-DayLabel -DayName $CheckDay), $CheckMode, $CheckWeeksInterval } else { 'nao sera criado/ajustado nesta execucao' })
+        'Espelho externo semanal' = $(if ($ConfigureExport) { "{0} | {1} | a cada {2} semana(s)" -f $ExportTime, (Get-DayLabel -DayName $ExportDay), $ExportWeeksInterval } else { 'nao sera criado/ajustado nesta execucao' })
+        'Conta da tarefa' = $RegisterParams.RunAs
+        'RunLevel Highest' = $(if ($RegisterParams.HighestPrivileges) { 'sim' } else { 'nao' })
+    })
+
+    $ApplySchedule = Read-YesNo -Prompt 'Aplicar este agendamento agora?' -Default $true
+    if (-not $ApplySchedule) {
+        throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
     }
 
     Assert-CanUpdateScheduledTasks -BackupSummary $BackupSummary -RunAs $RegisterParams.RunAs -HighestPrivileges ([bool]$RegisterParams.HighestPrivileges) -TaskPath $RegisterParams.TaskPath
@@ -1340,6 +1594,10 @@ function Update-ScheduleSettings {
 }
 
 function Test-TelegramPing {
+    Show-FlowHeader -Title 'TESTE DE TELEGRAM' -Goal 'Envia uma mensagem simples para validar se token e chat estao funcionando.' -Bullets @(
+        'o teste usa exatamente a configuracao atual gravada no projeto'
+    ) -ClearScreen
+
     $Token = Get-EffectiveValue -Name 'RESTIC_TELEGRAM_TOKEN'
     $ChatId = Get-EffectiveValue -Name 'RESTIC_TELEGRAM_CHATID'
 
@@ -1350,16 +1608,35 @@ function Test-TelegramPing {
 
     $Stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $Payload = @{ chat_id = $ChatId; text = "[TESTE] Centro de Controle em $Stamp" } | ConvertTo-Json -Compress
+    $TelegramApiHost = 'api.telegram.org'
 
     try {
-        $Result = Invoke-RestMethod -Uri "https://api.telegram.org/bot$Token/sendMessage" -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($Payload))
+        Resolve-DnsName -Name $TelegramApiHost -ErrorAction Stop | Out-Null
+        $Result = Invoke-RestMethod -Uri "https://$TelegramApiHost/bot$Token/sendMessage" -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($Payload))
         if ($Result.ok) {
             Write-Host '[OK] Ping Telegram enviado com sucesso.' -ForegroundColor Green
         } else {
             Write-Warning 'Telegram respondeu sem ok=true.'
         }
     } catch {
-        Write-Error "Falha ao enviar ping Telegram: $($_.Exception.Message)"
+        $Message = $_.Exception.Message
+        $WebException = $_.Exception
+        if ($_.Exception.PSObject.Properties.Match('InnerException').Count -gt 0 -and $null -ne $_.Exception.InnerException) {
+            $Message = $_.Exception.InnerException.Message
+            $WebException = $_.Exception.InnerException
+        }
+
+        if ($WebException -is [System.Net.WebException] -and $WebException.Status -eq [System.Net.WebExceptionStatus]::NameResolutionFailure) {
+            Write-Error 'Falha ao enviar ping Telegram: nao foi possivel resolver api.telegram.org. Isso indica problema de DNS/rede neste momento, nao erro na gravacao do token/chat.'
+            return
+        }
+
+        if ($Message -match 'api\.telegram\.org' -and $Message -match 'resolvido|resolved|NameResolutionFailure') {
+            Write-Error 'Falha ao enviar ping Telegram: api.telegram.org nao respondeu por DNS. Isso normalmente e falha transitória de rede, proxy, firewall ou DNS local.'
+            return
+        }
+
+        Write-Error "Falha ao enviar ping Telegram: $Message"
     }
 }
 
@@ -1367,6 +1644,16 @@ function Start-BackupNow {
     if (-not (Test-Path -LiteralPath $BackupNowBat)) {
         Write-Warning "Launcher nao encontrado: $BackupNowBat"
         return
+    }
+
+    Show-FlowHeader -Title 'BACKUP AGORA' -Goal 'Dispara imediatamente o launcher de backup manual.' -Bullets @(
+        'os logs vao para runtime\\logs',
+        'use esta opcao quando quiser testar ou rodar o backup fora do horario agendado'
+    ) -ClearScreen
+
+    $Continue = Read-YesNo -Prompt 'Executar o backup agora?' -Default $true
+    if (-not $Continue) {
+        throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
     }
 
     Write-Host '[INFO] Disparando backup imediato...' -ForegroundColor Cyan
@@ -1379,13 +1666,33 @@ function Start-RestoreFlow {
         return
     }
 
-    Show-InputTips -ExtraHint 'Se quiser restaurar tudo, deixe Includes vazio.'
+    Show-FlowHeader -Title 'RESTORE POR SNAPSHOT' -Goal 'Restaura um snapshot especifico para uma pasta escolhida por voce.' -Bullets @(
+        'o ideal e usar uma pasta nova ou vazia para revisar os arquivos antes de promover para o SSD',
+        'se quiser restaurar tudo, deixe Includes vazio',
+        'voce pode usar latest se quiser o snapshot mais recente'
+    ) -ClearScreen
 
-    $SnapshotId = Read-Text -Prompt 'Snapshot ID para restore (ex.: 4bd1dc54)'
+    Show-InputTips -ExtraHint 'No fim desta tela, o sistema mostra um resumo antes de iniciar o restore.'
+
+    $SnapshotId = Read-Text -Prompt 'Snapshot ID para restore' -Default 'latest'
     $TargetPath = Read-Text -Prompt 'Pasta de destino do restore'
     $IncludeRaw = Read-Text -Prompt 'Includes opcionais (; separados)' -AllowEmpty
 
     $Includes = @($IncludeRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $TargetAlreadyHasFiles = (Test-Path -LiteralPath $TargetPath) -and ($null -ne (Get-ChildItem -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue | Select-Object -First 1))
+
+    Show-KeyValueSummary -Title 'Resumo do restore:' -Pairs ([ordered]@{
+        'Snapshot' = $SnapshotId
+        'Destino' = $TargetPath
+        'Includes' = $(if ($Includes.Count -gt 0) { $Includes -join '; ' } else { '(todos os arquivos do snapshot)' })
+        'Destino ja contem arquivos' = $(if ($TargetAlreadyHasFiles) { 'sim, revise com cuidado' } else { 'nao' })
+    })
+
+    $Continue = Read-YesNo -Prompt 'Iniciar o restore agora?' -Default $true
+    if (-not $Continue) {
+        throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
+    }
+
     $RestoreCommandArgs = @(
         '-NoLogo'
         '-NoProfile'
@@ -1461,7 +1768,13 @@ function Start-ExternalDiskTransferFlow {
     $CurrentConfig = Get-CurrentConfig
     $DefaultExportPasswordFile = if ([string]::IsNullOrWhiteSpace($CurrentConfig.ExportPasswordFile)) { $CurrentConfig.SecretFilePath } else { $CurrentConfig.ExportPasswordFile }
 
-    Show-InputTips -ExtraHint 'O menu lista os discos USB detectados e cria a estrutura dentro de uma pasta base como X:\restic_backup.'
+    Show-FlowHeader -Title $(if ($Mode -eq 'Initial') { 'TRANSFERENCIA COMPLETA (INICIAL)' } else { 'ATUALIZACAO SEMANAL' }) -Goal $(if ($Mode -eq 'Initial') { 'Prepara a estrutura no disco externo e envia todos os snapshots ativos para um segundo repositorio Restic no HD externo.' } else { 'Atualiza esse segundo repositorio Restic no HD externo apenas com os snapshots que ainda faltam.' }) -Bullets @(
+        'o disco precisa estar conectado nesta hora',
+        'o sistema pede a pasta base no disco e trabalha dentro dela',
+        'o kit de recuperacao fica dentro da mesma pasta base'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'No fim desta tela, o sistema mostra o layout completo antes de iniciar a transferencia.'
 
     $Candidates = Get-ExternalDiskCandidates
     $Selected = Select-ExternalDiskCandidate -Candidates $Candidates -Mode $Mode
@@ -1491,15 +1804,21 @@ function Start-ExternalDiskTransferFlow {
     )
 
     if ($Mode -eq 'Initial') {
-        Write-Host ''
-        Write-Host 'Layout que sera usado no disco externo:' -ForegroundColor Cyan
-        Write-Host ("- Pasta base: {0}" -f $Layout.ExternalRoot)
-        Write-Host ("- Repositorio: {0}" -f $Layout.RepositoryPath)
-        Write-Host ("- Kit de recuperacao: {0}" -f $Layout.RecoveryKitPath)
-        Write-Host ("- Restore staging: {0}" -f $Layout.RestoreStagingPath)
-        Write-Host ''
-
         $TransferArgs += '-RefreshRecoveryKit'
+    }
+
+    Show-KeyValueSummary -Title 'Resumo da transferencia:' -Pairs ([ordered]@{
+        'Modo' = $(if ($Mode -eq 'Initial') { 'transferencia completa inicial' } else { 'atualizacao semanal' })
+        'Disco externo' = $Selected.DriveRoot
+        'Pasta base' = $Layout.ExternalRoot
+        'Repositorio externo' = $Layout.RepositoryPath
+        'Kit de recuperacao' = $Layout.RecoveryKitPath
+        'Restore staging' = $Layout.RestoreStagingPath
+    })
+
+    $Continue = Read-YesNo -Prompt 'Iniciar a transferencia agora?' -Default $true
+    if (-not $Continue) {
+        throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
     }
 
     & powershell.exe @TransferArgs
@@ -1520,7 +1839,14 @@ function Start-ExternalDiskRestoreFlow {
     $CurrentConfig = Get-CurrentConfig
     $DefaultExportPasswordFile = if ([string]::IsNullOrWhiteSpace($CurrentConfig.ExportPasswordFile)) { $CurrentConfig.SecretFilePath } else { $CurrentConfig.ExportPasswordFile }
 
-    Show-InputTips -ExtraHint 'Esse fluxo restaura tudo do repositório externo para a pasta restore-staging dentro da pasta base escolhida.'
+    Show-FlowHeader -Title 'DESEMPACOTAR TUDO NO DISCO EXTERNO' -Goal 'Restaura um snapshot completo do repositorio externo para a area de staging no proprio disco externo.' -Bullets @(
+        'isso e indicado para cenarios de desastre ou validacao antes de copiar de volta para o SSD',
+        'o destino final fica dentro de restore-staging, na pasta base escolhida',
+        'modo rapido nao revalida o conteudo ao final; modo verificado e mais lento, porem mais rigoroso',
+        'se voce interromper no meio, a pasta parcial permanece em restore-staging para avaliacao ou limpeza manual'
+    ) -ClearScreen
+
+    Show-InputTips -ExtraHint 'No fim desta tela, o sistema mostra o destino completo antes de iniciar o restore.'
 
     $Candidates = Get-ExternalDiskCandidates
     $Selected = Select-ExternalDiskCandidate -Candidates $Candidates -Mode 'RestoreAll'
@@ -1529,17 +1855,67 @@ function Start-ExternalDiskRestoreFlow {
     $Layout = Get-ExternalDiskTransferLayout -DriveLetter $Selected.DriveLetter -ExternalFolderPath $ExternalFolderPath
 
     if (-not (Test-Path -LiteralPath $Layout.RepositoryPath)) {
-        throw 'Nao existe repositório Restic nessa pasta base. Rode primeiro a transferencia completa.'
+        throw 'Nao existe repositorio Restic nessa pasta base. Rode primeiro a transferencia completa.'
     }
 
     $SnapshotId = Read-Text -Prompt 'Snapshot para desempacotar' -Default 'latest'
     $RestoreTargetFolderName = Read-Text -Prompt 'Nome da pasta dentro de restore-staging' -Default ('restore_{0}' -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
+    $VerifyRestore = Read-YesNo -Prompt 'Validar todo o conteudo ao final? Isso deixa o restore mais lento' -Default $false
+    $CleanRestoreTarget = $false
 
-    Write-Host ''
-    Write-Host 'Layout do desempacotamento:' -ForegroundColor Cyan
-    Write-Host ("- Repositorio externo: {0}" -f $Layout.RepositoryPath)
-    Write-Host ("- Destino do restore: {0}" -f (Join-Path $Layout.RestoreStagingPath $RestoreTargetFolderName))
-    Write-Host ''
+    while ($true) {
+        $RestoreTargetPath = Join-Path $Layout.RestoreStagingPath $RestoreTargetFolderName
+        $TargetHasItems = (Test-Path -LiteralPath $RestoreTargetPath) -and $null -ne (Get-ChildItem -LiteralPath $RestoreTargetPath -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $TargetHasItems) {
+            break
+        }
+
+        Write-Warning 'A pasta de restore escolhida ja contem arquivos. Isso normalmente indica um restore anterior incompleto ou um staging antigo.'
+        $RestoreStatusInfo = Get-RestoreStatusInfo -TargetPath $RestoreTargetPath
+        if ($null -ne $RestoreStatusInfo) {
+            Write-Host 'Ultimo status registrado nessa pasta:' -ForegroundColor DarkCyan
+            Write-Host ("- Estado: {0}" -f (Get-RestoreStatusLabel -RawStatus $RestoreStatusInfo.Status)) -ForegroundColor DarkCyan
+            if (-not [string]::IsNullOrWhiteSpace($RestoreStatusInfo.Timestamp)) {
+                Write-Host ("- Horario: {0}" -f $RestoreStatusInfo.Timestamp) -ForegroundColor DarkCyan
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RestoreStatusInfo.Snapshot)) {
+                Write-Host ("- Snapshot: {0}" -f $RestoreStatusInfo.Snapshot) -ForegroundColor DarkCyan
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RestoreStatusInfo.Verified)) {
+                $VerifiedText = if ($RestoreStatusInfo.Verified -eq 'True') { 'sim' } elseif ($RestoreStatusInfo.Verified -eq 'False') { 'nao' } else { $RestoreStatusInfo.Verified }
+                Write-Host ("- Verificacao final: {0}" -f $VerifiedText) -ForegroundColor DarkCyan
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RestoreStatusInfo.ExitCode) -and $RestoreStatusInfo.ExitCode -ne '0') {
+                Write-Host ("- Exit code: {0}" -f $RestoreStatusInfo.ExitCode) -ForegroundColor DarkCyan
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RestoreStatusInfo.Details)) {
+                Write-Host ("- Detalhes: {0}" -f $RestoreStatusInfo.Details) -ForegroundColor DarkCyan
+            }
+            Write-Host ''
+        }
+
+        $CleanRestoreTarget = Read-YesNo -Prompt 'Limpar essa pasta antes de iniciar o novo restore?' -Default $false
+        if ($CleanRestoreTarget) {
+            break
+        }
+
+        $RestoreTargetFolderName = Read-Text -Prompt 'Informe outro nome para a pasta dentro de restore-staging' -Default ('restore_{0}' -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'))
+    }
+
+    Show-KeyValueSummary -Title 'Resumo do desempacotamento:' -Pairs ([ordered]@{
+        'Disco externo' = $Selected.DriveRoot
+        'Pasta base' = $Layout.ExternalRoot
+        'Repositorio externo' = $Layout.RepositoryPath
+        'Snapshot' = $SnapshotId
+        'Modo' = $(if ($VerifyRestore) { 'verificado (mais lento)' } else { 'rapido (sem verificacao final)' })
+        'Preparacao do destino' = $(if ($CleanRestoreTarget) { 'limpar pasta existente antes do restore' } else { 'usar pasta nova ou vazia' })
+        'Destino do restore' = (Join-Path $Layout.RestoreStagingPath $RestoreTargetFolderName)
+    })
+
+    $Continue = Read-YesNo -Prompt 'Iniciar o desempacotamento agora?' -Default $true
+    if (-not $Continue) {
+        throw [System.OperationCanceledException]::new('Operacao cancelada. Nenhuma alteracao foi aplicada.')
+    }
 
     $RestoreArgs = @(
         '-NoLogo'
@@ -1562,6 +1938,14 @@ function Start-ExternalDiskRestoreFlow {
         $RestoreTargetFolderName
     )
 
+    if ($VerifyRestore) {
+        $RestoreArgs += '-VerifyRestore'
+    }
+
+    if ($CleanRestoreTarget) {
+        $RestoreArgs += '-CleanRestoreTarget'
+    }
+
     & powershell.exe @RestoreArgs
     $RestoreExitCode = $LASTEXITCODE
     if ($RestoreExitCode -ne 0) {
@@ -1580,8 +1964,11 @@ function Show-ExternalDiskTransferMenu {
         Write-Host ("Destino padrao atual: {0}" -f $(if ($CurrentConfig.ExportRepository) { $CurrentConfig.ExportRepository } else { '(nao configurado)' })) -ForegroundColor DarkCyan
         Write-Host ''
         Write-Host '[1] Transferencia completa (inicial)'
+        Write-Host '    Prepara a pasta base no disco e copia todos os snapshots ativos.' -ForegroundColor DarkCyan
         Write-Host '[2] Atualizacao semanal'
+        Write-Host '    Reusa a mesma pasta base e sincroniza somente o que falta.' -ForegroundColor DarkCyan
         Write-Host '[3] Desempacotar tudo no disco externo'
+        Write-Host '    Restaura um snapshot completo para restore-staging no proprio disco.' -ForegroundColor DarkCyan
         Write-Host '[0] Voltar ao menu principal'
         Write-Host ''
 
@@ -1631,22 +2018,30 @@ while ($true) {
     Write-Host '=========================================================' -ForegroundColor Cyan
     Write-Host ' RESTIC - CENTRO DE CONTROLE INTERATIVO' -ForegroundColor Cyan
     Write-Host '=========================================================' -ForegroundColor Cyan
-    Write-Host '[1] Ver painel resumido da configuracao'
-    Write-Host '[2] Ajustar agendamento do backup/check'
-    Write-Host '[3] Ajustar retencao e snapshots'
-    Write-Host '[4] Ajustar fontes e exclusoes do backup'
-    Write-Host '[5] Ajustar Telegram (token/chat)'
-    Write-Host '[6] Ajustar caminhos principais e espelho externo'
-    Write-Host '[7] Gerenciar perfis salvos'
+    Write-Host 'Fluxo recomendado para primeira configuracao: [6] caminhos -> [4] fontes -> [3] retencao -> [2] agendamento' -ForegroundColor DarkCyan
+    Write-Host ''
+    Write-Host 'VISUALIZACAO E DIAGNOSTICO' -ForegroundColor Cyan
+    Write-Host '[1] Painel resumido da configuracao'
+    Write-Host '[14] Visualizar snapshots mantidos pela politica'
+    Write-Host '[12] Configuracao tecnica completa'
     Write-Host '[8] Testar envio Telegram'
+    Write-Host ''
+    Write-Host 'CONFIGURACAO' -ForegroundColor Cyan
+    Write-Host '[2] Agendamento do backup, check e espelho externo'
+    Write-Host '[3] Politica de retencao de snapshots'
+    Write-Host '[4] Fontes e exclusoes do backup'
+    Write-Host '[5] Telegram (token e chat)'
+    Write-Host '[6] Caminhos principais e destino externo'
+    Write-Host '[7] Perfis salvos'
+    Write-Host '[13] Assistente completo avancado'
+    Write-Host ''
+    Write-Host 'OPERACOES' -ForegroundColor Cyan
     Write-Host '[9] Rodar backup agora'
     Write-Host '[10] Restore de snapshot'
     Write-Host '[11] Transferencia para DISCO EXTERNO'
-    Write-Host '[12] Ver configuracao tecnica completa'
-    Write-Host '[13] Abrir assistente completo avancado'
     Write-Host '[0] Sair'
     Write-Host ''
-    Write-Host 'Dica: nas telas de edicao, digite "voltar" para cancelar e retornar.' -ForegroundColor DarkCyan
+    Write-Host 'Dica: nas telas de edicao, digite "voltar" para cancelar sem aplicar nada.' -ForegroundColor DarkCyan
     Write-Host ''
 
     $Choice = Read-Host 'Escolha uma opcao'
@@ -1711,6 +2106,10 @@ while ($true) {
             }
             '12' {
                 & $ShowScript
+                Read-MenuPause
+            }
+            '14' {
+                Show-RetentionLayoutPreview
                 Read-MenuPause
             }
             '13' {
