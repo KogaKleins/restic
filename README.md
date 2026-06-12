@@ -64,7 +64,6 @@ C:\restic
 
 Este projeto segue estes principios:
 
-- nenhum token, senha ou repositorio de producao fica hardcoded nos scripts principais
 - a configuracao vem de variaveis RESTIC_* no Windows, resolvidas em Process -> User -> Machine
 - o arquivo de senha do Restic fica fora do codigo, em runtime/secrets/ ou em outro caminho definido pelo operador
 - logs e segredos ficam em runtime/, separados da logica da aplicacao
