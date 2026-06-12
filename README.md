@@ -75,8 +75,6 @@ Este projeto segue estes principios:
 - runtime/logs com historico operacional
 - runtime/bin/restic.exe se a estrategia da equipe for instalar o Restic via winget ou outro gerenciador central
 
-- Então ATENÇÃO, se quiser passar para alguém, tenha certeza que não passou a pasta runtime!
-
 ## Fluxo Recomendado de Implantacao
 
 ### Opcao 1: instalacao assistida
